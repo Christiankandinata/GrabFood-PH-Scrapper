@@ -151,20 +151,20 @@ async def debug_scrape(location: str = Query(default="quezon_city")):
             # Step 3: Set localStorage
             debug_info["steps"].append("Step 2: Setting localStorage...")
             try:
-                await page.evaluate("""(lat, lng, label) => {
+                await page.evaluate("""(params) => {
                     const loc = {
-                        latitude: lat,
-                        longitude: lng,
-                        address: label,
+                        latitude: params.lat,
+                        longitude: params.lng,
+                        address: params.label,
                         countryCode: "PH",
                         isAccurate: true,
-                        addressDetail: label,
+                        addressDetail: params.label,
                         noteToDriver: "",
-                        city: label
+                        city: params.label
                     };
                     localStorage.setItem('location', JSON.stringify(loc));
                     localStorage.setItem('gfc_country', 'PH');
-                }""", lat, lng, label)
+                }""", {"lat": lat, "lng": lng, "label": label})
 
                 ls_data = await page.evaluate("""() => ({
                     location: localStorage.getItem('location'),
@@ -342,16 +342,16 @@ async def scrape_grabfood(job_id: str, location_key: str, custom_lat: Optional[f
 
             # ---- Step 2: Set localStorage with location ----
             scrape_jobs[job_id]["message"] = "Setting location..."
-            await page.evaluate("""(lat, lng, label) => {
+            await page.evaluate("""(params) => {
                 const loc = {
-                    latitude: lat, longitude: lng,
-                    address: label, countryCode: "PH",
-                    isAccurate: true, addressDetail: label,
-                    noteToDriver: "", city: label
+                    latitude: params.lat, longitude: params.lng,
+                    address: params.label, countryCode: "PH",
+                    isAccurate: true, addressDetail: params.label,
+                    noteToDriver: "", city: params.label
                 };
                 localStorage.setItem('location', JSON.stringify(loc));
                 localStorage.setItem('gfc_country', 'PH');
-            }""", lat, lng, label)
+            }""", {"lat": lat, "lng": lng, "label": label})
 
             # ---- Step 3: Reload so localStorage takes effect ----
             scrape_jobs[job_id]["message"] = "Reloading with location set..."
