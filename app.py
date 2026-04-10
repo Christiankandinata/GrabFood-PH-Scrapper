@@ -1,10 +1,8 @@
 """
-GrabFood Philippines Merchant Scraper
-=====================================
-FastAPI web app that scrapes merchant data (including lat/long) from GrabFood PH
-by intercepting the internal portal.grab.com/foodweb/v2/search API calls.
-
-Designed for deployment on Render (free tier).
+GrabFood Philippines Merchant Scraper — v2
+===========================================
+Key fix: adds /api/debug endpoint to inspect exactly what the page returns.
+Uses storageState approach + page reload for localStorage to take effect.
 """
 
 import asyncio
@@ -12,6 +10,7 @@ import json
 import os
 import csv
 import io
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -23,22 +22,17 @@ from starlette.requests import Request
 
 from playwright.async_api import async_playwright
 
-# Ensure static directory exists (no need for .gitkeep)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("grabscraper")
+
 os.makedirs("static", exist_ok=True)
 
-app = FastAPI(title="GrabFood PH Scraper", version="1.0.0")
+app = FastAPI(title="GrabFood PH Scraper", version="2.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
-# ---------------------------------------------------------------------------
-# In-memory store for scrape results & status
-# (For production, swap with Redis or a DB)
-# ---------------------------------------------------------------------------
 scrape_jobs: dict = {}
 
-# ---------------------------------------------------------------------------
-# Predefined locations across the Philippines
-# ---------------------------------------------------------------------------
 PH_LOCATIONS = {
     "manila": {"lat": 14.5995, "lng": 120.9842, "label": "Manila"},
     "makati": {"lat": 14.5547, "lng": 121.0244, "label": "Makati"},
@@ -64,295 +58,469 @@ PH_LOCATIONS = {
 
 
 # ---------------------------------------------------------------------------
-# Scraper Logic
+# Helper: launch browser with common config
+# ---------------------------------------------------------------------------
+async def launch_browser(pw):
+    browser = await pw.chromium.launch(
+        headless=True,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--single-process",
+        ]
+    )
+    return browser
+
+
+async def create_context(browser, lat, lng):
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        locale="en-PH",
+        geolocation={"latitude": lat, "longitude": lng},
+        permissions=["geolocation"],
+    )
+    return context
+
+
+# ---------------------------------------------------------------------------
+# DEBUG ENDPOINT — run this first to see what GrabFood returns!
+# Visit: https://your-app.onrender.com/api/debug?location=quezon_city
+# ---------------------------------------------------------------------------
+@app.get("/api/debug")
+async def debug_scrape(location: str = Query(default="quezon_city")):
+    """
+    Diagnostic endpoint: shows exactly what the page returns.
+    Visit this URL in your browser to understand why 0 merchants.
+    """
+    loc = PH_LOCATIONS.get(location, PH_LOCATIONS["manila"])
+    lat, lng, label = loc["lat"], loc["lng"], loc["label"]
+
+    debug_info = {
+        "location": label,
+        "lat": lat,
+        "lng": lng,
+        "steps": [],
+    }
+
+    try:
+        async with async_playwright() as p:
+            browser = await launch_browser(p)
+            context = await create_context(browser, lat, lng)
+            page = await context.new_page()
+
+            # Track API calls
+            api_calls = []
+            async def on_response(resp):
+                if "grab.com" in resp.url and any(k in resp.url for k in ["search", "merchant", "foodweb"]):
+                    try:
+                        body = await resp.text()
+                        api_calls.append({
+                            "url": resp.url[:150],
+                            "status": resp.status,
+                            "body_preview": body[:500] if body else "EMPTY",
+                        })
+                    except:
+                        api_calls.append({"url": resp.url[:150], "status": resp.status, "body_preview": "UNREADABLE"})
+            page.on("response", on_response)
+
+            # Step 1: Visit homepage
+            debug_info["steps"].append("Step 1: Visiting homepage...")
+            try:
+                resp = await page.goto("https://food.grab.com/ph/en/", wait_until="domcontentloaded", timeout=30000)
+                debug_info["steps"].append(f"  Homepage status: {resp.status if resp else 'NO RESPONSE'}")
+                debug_info["steps"].append(f"  URL after load: {page.url}")
+            except Exception as e:
+                debug_info["steps"].append(f"  Homepage error: {str(e)[:200]}")
+
+            await page.wait_for_timeout(3000)
+
+            # Step 2: Check page content
+            title = await page.title()
+            debug_info["page_title"] = title
+
+            body_text = await page.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : 'NO BODY'")
+            debug_info["page_body_preview"] = body_text
+
+            # Step 3: Set localStorage
+            debug_info["steps"].append("Step 2: Setting localStorage...")
+            try:
+                await page.evaluate("""(lat, lng, label) => {
+                    const loc = {
+                        latitude: lat,
+                        longitude: lng,
+                        address: label,
+                        countryCode: "PH",
+                        isAccurate: true,
+                        addressDetail: label,
+                        noteToDriver: "",
+                        city: label
+                    };
+                    localStorage.setItem('location', JSON.stringify(loc));
+                    localStorage.setItem('gfc_country', 'PH');
+                }""", lat, lng, label)
+
+                ls_data = await page.evaluate("""() => ({
+                    location: localStorage.getItem('location'),
+                    country: localStorage.getItem('gfc_country'),
+                    allKeys: Object.keys(localStorage),
+                    allData: JSON.stringify(localStorage)
+                })""")
+                debug_info["localStorage"] = {
+                    "keys": ls_data["allKeys"],
+                    "location_set": ls_data["location"] is not None,
+                    "location_preview": (ls_data["location"] or "")[:200],
+                }
+                debug_info["steps"].append(f"  localStorage keys: {ls_data['allKeys']}")
+            except Exception as e:
+                debug_info["steps"].append(f"  localStorage error: {str(e)[:200]}")
+
+            # Step 4: Reload page (so localStorage takes effect)
+            debug_info["steps"].append("Step 3: Reloading page with localStorage set...")
+            try:
+                await page.reload(wait_until="networkidle", timeout=60000)
+                await page.wait_for_timeout(5000)
+                debug_info["steps"].append(f"  URL after reload: {page.url}")
+
+                body_after = await page.evaluate("() => document.body ? document.body.innerText.substring(0, 1000) : 'NO BODY'")
+                debug_info["page_body_after_reload"] = body_after
+            except Exception as e:
+                debug_info["steps"].append(f"  Reload error: {str(e)[:200]}")
+
+            # Step 5: Navigate to restaurants page
+            debug_info["steps"].append("Step 4: Navigating to /restaurants...")
+            try:
+                await page.goto("https://food.grab.com/ph/en/restaurants", wait_until="networkidle", timeout=60000)
+                await page.wait_for_timeout(5000)
+                debug_info["steps"].append(f"  Restaurants URL: {page.url}")
+
+                rest_body = await page.evaluate("() => document.body ? document.body.innerText.substring(0, 1500) : 'NO BODY'")
+                debug_info["restaurants_page_body"] = rest_body
+            except Exception as e:
+                debug_info["steps"].append(f"  Restaurants error: {str(e)[:200]}")
+
+            # Step 6: Check __NEXT_DATA__
+            debug_info["steps"].append("Step 5: Checking __NEXT_DATA__...")
+            try:
+                nd_raw = await page.evaluate("""() => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    return el ? el.textContent.substring(0, 5000) : 'NOT_FOUND';
+                }""")
+                if nd_raw != "NOT_FOUND":
+                    # Try to parse it
+                    full_nd = await page.evaluate("""() => {
+                        const el = document.getElementById('__NEXT_DATA__');
+                        return el ? el.textContent : null;
+                    }""")
+                    if full_nd:
+                        nd = json.loads(full_nd)
+                        debug_info["next_data_keys"] = list(nd.keys())
+                        if "props" in nd:
+                            props = nd["props"]
+                            debug_info["next_data_props_keys"] = list(props.keys())
+                            if "pageProps" in props:
+                                pp = props["pageProps"]
+                                debug_info["next_data_pageProps_keys"] = list(pp.keys())
+                                # Show first 3000 chars
+                                debug_info["next_data_pageProps_preview"] = json.dumps(pp)[:3000]
+
+                                # Try to find merchants
+                                found = find_merchants_in_data(nd)
+                                debug_info["merchants_found_in_next_data"] = len(found)
+                                if found:
+                                    debug_info["sample_merchant"] = json.dumps(found[0])[:500]
+                else:
+                    debug_info["next_data"] = "NOT FOUND IN PAGE"
+            except Exception as e:
+                debug_info["steps"].append(f"  __NEXT_DATA__ error: {str(e)[:200]}")
+
+            # Step 7: Check captured API calls
+            debug_info["api_calls_captured"] = len(api_calls)
+            debug_info["api_calls"] = api_calls[:10]
+
+            # Step 8: Try to find restaurant cards in DOM
+            debug_info["steps"].append("Step 6: Looking for restaurant elements in DOM...")
+            try:
+                restaurant_count = await page.evaluate("""() => {
+                    const selectors = [
+                        '[class*="RestaurantList"]',
+                        '[class*="restaurant"]',
+                        '[class*="merchant"]',
+                        '[class*="vendor"]',
+                        'a[href*="/restaurant/"]',
+                        '[data-testid*="restaurant"]',
+                        '[data-testid*="merchant"]',
+                    ];
+                    const results = {};
+                    for (const sel of selectors) {
+                        try {
+                            results[sel] = document.querySelectorAll(sel).length;
+                        } catch(e) {
+                            results[sel] = 'error: ' + e.message;
+                        }
+                    }
+                    return results;
+                }""")
+                debug_info["dom_restaurant_selectors"] = restaurant_count
+            except Exception as e:
+                debug_info["steps"].append(f"  DOM check error: {str(e)[:200]}")
+
+            # Step 9: Take a screenshot
+            debug_info["steps"].append("Step 7: Taking screenshot...")
+            try:
+                screenshot_path = "/app/static/debug_screenshot.png"
+                if not os.path.exists("/app/static"):
+                    screenshot_path = "static/debug_screenshot.png"
+                await page.screenshot(path=screenshot_path, full_page=False)
+                debug_info["screenshot"] = "/static/debug_screenshot.png"
+            except Exception as e:
+                debug_info["steps"].append(f"  Screenshot error: {str(e)[:200]}")
+
+            # Step 10: Get all cookies
+            cookies = await context.cookies()
+            grab_cookies = [{"name": c["name"], "value": str(c["value"])[:80]} for c in cookies if "grab" in c.get("domain", "")]
+            debug_info["cookies"] = grab_cookies
+
+            await browser.close()
+
+    except Exception as e:
+        debug_info["fatal_error"] = str(e)
+
+    return JSONResponse(content=debug_info)
+
+
+# ---------------------------------------------------------------------------
+# Scraper Logic (v2)
 # ---------------------------------------------------------------------------
 async def scrape_grabfood(job_id: str, location_key: str, custom_lat: Optional[float] = None, custom_lng: Optional[float] = None):
-    """
-    Scrapes GrabFood PH merchants using a hybrid approach:
-    1. Uses Playwright to visit the site, set localStorage (location), and capture valid headers
-    2. Then directly calls portal.grab.com/foodweb/v2/search API with those headers
-    3. Paginates through all results using the offset parameter
-    """
     scrape_jobs[job_id]["status"] = "running"
     scrape_jobs[job_id]["message"] = "Launching browser..."
 
     merchants = {}
 
     if custom_lat and custom_lng:
-        lat = custom_lat
-        lng = custom_lng
+        lat, lng = custom_lat, custom_lng
         label = f"Custom ({lat}, {lng})"
     else:
         loc = PH_LOCATIONS.get(location_key, PH_LOCATIONS["manila"])
-        lat = loc["lat"]
-        lng = loc["lng"]
-        label = loc["label"]
+        lat, lng, label = loc["lat"], loc["lng"], loc["label"]
 
     scrape_jobs[job_id]["location"] = label
+    logger.info(f"Starting scrape for {label} ({lat}, {lng})")
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                ]
-            )
-
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 800},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                locale="en-PH",
-                geolocation={"latitude": lat, "longitude": lng},
-                permissions=["geolocation"],
-            )
-
+            browser = await launch_browser(p)
+            context = await create_context(browser, lat, lng)
             page = await context.new_page()
 
-            # ---- Step 1: Visit the page to get a valid session ----
-            scrape_jobs[job_id]["message"] = f"Opening GrabFood ({label})..."
-
-            await page.goto("https://food.grab.com/ph/en/", wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
-
-            # ---- Step 2: Set localStorage with location data (this is the key!) ----
-            scrape_jobs[job_id]["message"] = "Setting location via localStorage..."
-
-            location_data = json.dumps({
-                "latitude": lat,
-                "longitude": lng,
-                "address": label,
-                "countryCode": "PH",
-                "isAccurate": True,
-                "addressDetail": label,
-                "noteToDriver": "",
-                "city": label,
-            })
-
-            await page.evaluate(f"""() => {{
-                localStorage.setItem('location', JSON.stringify({location_data}));
-                localStorage.setItem('gfc_country', 'PH');
-            }}""")
-
-            # ---- Step 3: Navigate to restaurants page with location set ----
-            scrape_jobs[job_id]["message"] = "Loading restaurants page..."
-
-            captured_headers = {}
             api_responses = []
 
-            async def capture_request(request):
-                nonlocal captured_headers
-                if "portal.grab.com/foodweb/v2/search" in request.url:
-                    captured_headers = dict(request.headers)
-
             async def capture_response(response):
-                if "portal.grab.com/foodweb/v2/search" in response.url:
+                url = response.url
+                if "grab.com" in url and ("search" in url or "foodweb" in url):
                     try:
                         body = await response.json()
                         api_responses.append(body)
-                    except Exception:
+                        logger.info(f"Captured API response from {url[:80]}")
+                    except:
                         pass
 
-            page.on("request", capture_request)
             page.on("response", capture_response)
 
+            # ---- Step 1: Visit homepage to establish session ----
+            scrape_jobs[job_id]["message"] = "Opening GrabFood homepage..."
+            await page.goto("https://food.grab.com/ph/en/", wait_until="domcontentloaded", timeout=60000)
+            await page.wait_for_timeout(3000)
+            logger.info(f"Homepage loaded: {page.url}")
+
+            # ---- Step 2: Set localStorage with location ----
+            scrape_jobs[job_id]["message"] = "Setting location..."
+            await page.evaluate("""(lat, lng, label) => {
+                const loc = {
+                    latitude: lat, longitude: lng,
+                    address: label, countryCode: "PH",
+                    isAccurate: true, addressDetail: label,
+                    noteToDriver: "", city: label
+                };
+                localStorage.setItem('location', JSON.stringify(loc));
+                localStorage.setItem('gfc_country', 'PH');
+            }""", lat, lng, label)
+
+            # ---- Step 3: Reload so localStorage takes effect ----
+            scrape_jobs[job_id]["message"] = "Reloading with location set..."
+            await page.reload(wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(3000)
+
+            # ---- Step 4: Navigate to restaurants page ----
+            scrape_jobs[job_id]["message"] = "Loading restaurants..."
             await page.goto("https://food.grab.com/ph/en/restaurants", wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(5000)
+            logger.info(f"Restaurants page loaded: {page.url}")
 
-            # ---- Step 4: Extract from __NEXT_DATA__ ----
-            scrape_jobs[job_id]["message"] = "Extracting initial page data..."
-
+            # ---- Step 5: Extract __NEXT_DATA__ ----
+            scrape_jobs[job_id]["message"] = "Extracting page data..."
             try:
-                next_data_raw = await page.evaluate("""() => {
+                nd_raw = await page.evaluate("""() => {
                     const el = document.getElementById('__NEXT_DATA__');
                     return el ? el.textContent : null;
                 }""")
-
-                if next_data_raw:
-                    next_data = json.loads(next_data_raw)
-                    # Walk through all possible paths in the NEXT_DATA structure
-                    found_merchants = find_merchants_in_data(next_data)
-                    for m in found_merchants:
+                if nd_raw:
+                    nd = json.loads(nd_raw)
+                    found = find_merchants_in_data(nd)
+                    for m in found:
                         mid = m.get("id", m.get("chainID", "unknown"))
                         merchants[mid] = extract_merchant_data(m)
-
-                    scrape_jobs[job_id]["message"] = f"Found {len(merchants)} merchants from page data"
-                    scrape_jobs[job_id]["count"] = len(merchants)
-
+                    logger.info(f"__NEXT_DATA__: found {len(found)} merchants")
             except Exception as e:
-                scrape_jobs[job_id]["message"] = f"Initial extraction note: {str(e)[:80]}"
+                logger.warning(f"__NEXT_DATA__ error: {e}")
 
-            # Also process any API responses captured during page load
+            # Process any API responses from page load
             for resp in api_responses:
-                found = find_merchants_in_data(resp)
-                for m in found:
+                for m in find_merchants_in_data(resp):
                     mid = m.get("id", m.get("chainID", "unknown"))
                     merchants[mid] = extract_merchant_data(m)
 
             scrape_jobs[job_id]["count"] = len(merchants)
+            scrape_jobs[job_id]["message"] = f"Initial: {len(merchants)} merchants. Paginating..."
 
-            # ---- Step 5: Click Load More OR call API directly ----
-            scrape_jobs[job_id]["message"] = f"Paginating... ({len(merchants)} merchants so far)"
-
-            # Try clicking Load More button
-            load_more_clicks = 0
+            # ---- Step 6: Click Load More repeatedly ----
             consecutive_fails = 0
+            pages_loaded = 0
+            prev_api_count = len(api_responses)
 
-            for i in range(150):  # safety limit
+            for i in range(150):
                 try:
-                    # Try multiple selectors for the Load More button
-                    load_more_btn = None
-                    for selector in [
+                    # Try multiple selectors
+                    btn = None
+                    for sel in [
                         'button.ant-btn.ant-btn-block',
                         'button:has-text("Load More")',
                         'button:has-text("Show More")',
-                        '[class*="loadMore"]',
-                        '[class*="load-more"]',
-                        'button.RestaurantListCol___StyledButton',
+                        '[class*="loadMore"] button',
+                        '[class*="load-more"] button',
                         'button[class*="RestaurantList"]',
-                        'div[class*="RestaurantList"] button',
                     ]:
                         try:
-                            btn = await page.query_selector(selector)
-                            if btn:
-                                is_visible = await btn.is_visible()
-                                if is_visible:
-                                    load_more_btn = btn
-                                    break
-                        except Exception:
+                            candidate = await page.query_selector(sel)
+                            if candidate and await candidate.is_visible():
+                                btn = candidate
+                                break
+                        except:
                             continue
 
-                    if not load_more_btn:
+                    if not btn:
+                        # Try scrolling
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        await page.wait_for_timeout(2000)
                         consecutive_fails += 1
                         if consecutive_fails >= 3:
                             break
-                        # Try scrolling to bottom to reveal button
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_timeout(2000)
                         continue
 
                     consecutive_fails = 0
+                    await btn.scroll_into_view_if_needed()
+                    await page.wait_for_timeout(300)
+                    await btn.click()
+                    pages_loaded += 1
 
-                    # Clear previous responses
-                    prev_count = len(api_responses)
-
-                    await load_more_btn.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(500)
-                    await load_more_btn.click()
-                    load_more_clicks += 1
-
-                    # Wait for new API response
                     await page.wait_for_timeout(4000)
 
-                    # Process any new API responses
-                    for resp in api_responses[prev_count:]:
-                        found = find_merchants_in_data(resp)
-                        for m in found:
+                    # Process new API responses
+                    for resp in api_responses[prev_api_count:]:
+                        for m in find_merchants_in_data(resp):
                             mid = m.get("id", m.get("chainID", "unknown"))
                             merchants[mid] = extract_merchant_data(m)
+                    prev_api_count = len(api_responses)
 
                     scrape_jobs[job_id]["count"] = len(merchants)
-                    scrape_jobs[job_id]["message"] = f"Loading... {len(merchants)} merchants ({load_more_clicks} pages)"
-
-                    # Check if we got new results
-                    if len(api_responses) == prev_count:
-                        consecutive_fails += 1
-                        if consecutive_fails >= 3:
-                            break
+                    scrape_jobs[job_id]["message"] = f"Loading... {len(merchants)} merchants ({pages_loaded} pages)"
 
                 except Exception as e:
+                    logger.warning(f"Load more error: {e}")
                     consecutive_fails += 1
                     if consecutive_fails >= 3:
                         break
 
-            # ---- Step 6: Also try direct API calls if we captured headers ----
-            if captured_headers and len(merchants) == 0:
-                scrape_jobs[job_id]["message"] = "Trying direct API calls..."
-                merchants = await try_direct_api(page, context, lat, lng, scrape_jobs, job_id)
+            # ---- Step 7: Fallback — try direct API from browser ----
+            if len(merchants) == 0:
+                scrape_jobs[job_id]["message"] = "Trying direct API approach..."
+                logger.info("No merchants from page. Trying direct API from browser context...")
+                direct = await try_direct_api(page, lat, lng, scrape_jobs, job_id)
+                merchants.update(direct)
 
             await browser.close()
 
-        # Store results
         scrape_jobs[job_id]["status"] = "completed"
         scrape_jobs[job_id]["count"] = len(merchants)
         scrape_jobs[job_id]["merchants"] = list(merchants.values())
         scrape_jobs[job_id]["completed_at"] = datetime.now().isoformat()
         scrape_jobs[job_id]["message"] = f"Done! Scraped {len(merchants)} merchants from {label}"
+        logger.info(f"Completed: {len(merchants)} merchants from {label}")
 
     except Exception as e:
+        logger.error(f"Scrape error: {e}")
         scrape_jobs[job_id]["status"] = "error"
         scrape_jobs[job_id]["message"] = f"Error: {str(e)}"
 
 
 def find_merchants_in_data(data, depth=0) -> list:
-    """Recursively search for merchant arrays in nested data structures."""
     if depth > 10:
         return []
-
     merchants = []
-
     if isinstance(data, dict):
-        # Direct match
-        if "searchMerchants" in data:
-            sm = data["searchMerchants"]
-            if isinstance(sm, list):
-                merchants.extend(sm)
-
-        # Check if this dict itself looks like a merchant
+        if "searchMerchants" in data and isinstance(data["searchMerchants"], list):
+            merchants.extend(data["searchMerchants"])
         if "latlng" in data and ("id" in data or "chainID" in data):
             merchants.append(data)
-
-        # Recurse into values
-        for key, value in data.items():
-            if isinstance(value, (dict, list)):
-                merchants.extend(find_merchants_in_data(value, depth + 1))
-
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                merchants.extend(find_merchants_in_data(v, depth + 1))
     elif isinstance(data, list):
         for item in data:
             if isinstance(item, (dict, list)):
                 merchants.extend(find_merchants_in_data(item, depth + 1))
-
     return merchants
 
 
-async def try_direct_api(page, context, lat, lng, scrape_jobs, job_id) -> dict:
-    """
-    Fallback: directly call the GrabFood search API from within the browser context
-    to bypass any CORS or session issues.
-    """
+async def try_direct_api(page, lat, lng, scrape_jobs, job_id) -> dict:
     merchants = {}
     offset = 0
     page_size = 32
 
-    for attempt in range(50):  # max 50 pages
+    for attempt in range(50):
         try:
-            result = await page.evaluate(f"""async () => {{
-                try {{
-                    const resp = await fetch('https://portal.grab.com/foodweb/v2/search', {{
+            result = await page.evaluate("""async (params) => {
+                try {
+                    const resp = await fetch('https://portal.grab.com/foodweb/v2/search', {
                         method: 'POST',
-                        headers: {{
+                        headers: {
                             'Content-Type': 'application/json',
                             'x-gfc-country': 'PH',
-                        }},
-                        body: JSON.stringify({{
-                            "latlng": "{lat},{lng}",
-                            "keyword": "",
-                            "offset": {offset},
-                            "pageSize": {page_size},
-                            "countryCode": "PH"
-                        }})
-                    }});
+                        },
+                        body: JSON.stringify({
+                            latlng: params.lat + ',' + params.lng,
+                            keyword: '',
+                            offset: params.offset,
+                            pageSize: params.pageSize,
+                            countryCode: 'PH',
+                        })
+                    });
+                    if (!resp.ok) return {error: 'HTTP ' + resp.status, status: resp.status};
                     return await resp.json();
-                }} catch(e) {{
-                    return {{"error": e.message}};
-                }}
-            }}""")
+                } catch(e) {
+                    return {error: e.message};
+                }
+            }""", {"lat": str(lat), "lng": str(lng), "offset": offset, "pageSize": page_size})
 
             if not result or "error" in result:
+                logger.info(f"Direct API stopped: {result}")
                 break
 
             found = find_merchants_in_data(result)
@@ -365,32 +533,27 @@ async def try_direct_api(page, context, lat, lng, scrape_jobs, job_id) -> dict:
 
             scrape_jobs[job_id]["count"] = len(merchants)
             scrape_jobs[job_id]["message"] = f"Direct API: {len(merchants)} merchants (page {attempt + 1})"
-
             offset += page_size
-
-            # Small delay to be polite
             await page.wait_for_timeout(1500)
 
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Direct API error: {e}")
             break
 
     return merchants
 
 
 def extract_merchant_data(m: dict) -> dict:
-    """Extract relevant fields from a merchant object."""
     latlng = m.get("latlng", {})
     address = m.get("address", {})
     eta = m.get("estimatedDeliveryTime", None)
     fee = m.get("estimatedDeliveryFee", {})
-
     cuisine_list = []
     cuisines = m.get("merchantBrief", {}).get("cuisine", []) or m.get("cuisines", [])
     if isinstance(cuisines, list):
         cuisine_list = cuisines
     elif isinstance(cuisines, str):
         cuisine_list = [cuisines]
-
     return {
         "id": m.get("id", ""),
         "name": m.get("address", {}).get("name", "") or m.get("chainName", "") or m.get("name", ""),
@@ -432,16 +595,10 @@ async def start_scrape(
 ):
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{location}"
     scrape_jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "message": "Job queued...",
-        "location": location,
-        "count": 0,
-        "merchants": [],
-        "created_at": datetime.now().isoformat(),
-        "completed_at": None,
+        "job_id": job_id, "status": "queued", "message": "Job queued...",
+        "location": location, "count": 0, "merchants": [],
+        "created_at": datetime.now().isoformat(), "completed_at": None,
     }
-
     background_tasks.add_task(scrape_grabfood, job_id, location, custom_lat, custom_lng)
     return JSONResponse(content={"job_id": job_id, "status": "queued"})
 
@@ -452,13 +609,9 @@ async def get_status(job_id: str):
     if not job:
         return JSONResponse(content={"error": "Job not found"}, status_code=404)
     return JSONResponse(content={
-        "job_id": job["job_id"],
-        "status": job["status"],
-        "message": job["message"],
-        "location": job.get("location", ""),
-        "count": job["count"],
-        "created_at": job["created_at"],
-        "completed_at": job["completed_at"],
+        "job_id": job["job_id"], "status": job["status"], "message": job["message"],
+        "location": job.get("location", ""), "count": job["count"],
+        "created_at": job["created_at"], "completed_at": job["completed_at"],
     })
 
 
@@ -468,10 +621,8 @@ async def get_results(job_id: str):
     if not job:
         return JSONResponse(content={"error": "Job not found"}, status_code=404)
     return JSONResponse(content={
-        "job_id": job["job_id"],
-        "status": job["status"],
-        "count": job["count"],
-        "location": job.get("location", ""),
+        "job_id": job["job_id"], "status": job["status"],
+        "count": job["count"], "location": job.get("location", ""),
         "merchants": job.get("merchants", []),
     })
 
@@ -481,7 +632,6 @@ async def export_csv(job_id: str):
     job = scrape_jobs.get(job_id)
     if not job or not job.get("merchants"):
         return JSONResponse(content={"error": "No data to export"}, status_code=404)
-
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=[
         "id", "name", "chain_id", "chain_name", "latitude", "longitude",
@@ -494,33 +644,21 @@ async def export_csv(job_id: str):
         row["cuisines"] = ", ".join(row.get("cuisines", []))
         row.pop("promo", None)
         writer.writerow(row)
-
     output.seek(0)
     return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
+        iter([output.getvalue()]), media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename=grabfood_{job.get('location', 'export')}_{datetime.now().strftime('%Y%m%d')}.csv"},
     )
 
 
 @app.get("/api/jobs")
 async def list_jobs():
-    jobs_summary = []
-    for jid, job in scrape_jobs.items():
-        jobs_summary.append({
-            "job_id": jid,
-            "status": job["status"],
-            "location": job.get("location", ""),
-            "count": job["count"],
-            "created_at": job["created_at"],
-            "completed_at": job["completed_at"],
-        })
-    return JSONResponse(content=jobs_summary)
+    return JSONResponse(content=[{
+        "job_id": jid, "status": j["status"], "location": j.get("location", ""),
+        "count": j["count"], "created_at": j["created_at"], "completed_at": j["completed_at"],
+    } for jid, j in scrape_jobs.items()])
 
 
-# ---------------------------------------------------------------------------
-# Health check for Render
-# ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
     return {"status": "ok"}
