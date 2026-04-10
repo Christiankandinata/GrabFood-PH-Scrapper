@@ -296,7 +296,7 @@ async def debug_scrape(location: str = Query(default="quezon_city")):
 
 
 # ---------------------------------------------------------------------------
-# Scraper Logic (v2)
+# Scraper Logic (v3 — direct API pagination, no Load More button needed)
 # ---------------------------------------------------------------------------
 async def scrape_grabfood(job_id: str, location_key: str, custom_lat: Optional[float] = None, custom_lng: Optional[float] = None):
     scrape_jobs[job_id]["status"] = "running"
@@ -320,28 +320,13 @@ async def scrape_grabfood(job_id: str, location_key: str, custom_lat: Optional[f
             context = await create_context(browser, lat, lng)
             page = await context.new_page()
 
-            api_responses = []
-
-            async def capture_response(response):
-                url = response.url
-                if "grab.com" in url and ("search" in url or "foodweb" in url):
-                    try:
-                        body = await response.json()
-                        api_responses.append(body)
-                        logger.info(f"Captured API response from {url[:80]}")
-                    except:
-                        pass
-
-            page.on("response", capture_response)
-
-            # ---- Step 1: Visit homepage to establish session ----
-            scrape_jobs[job_id]["message"] = "Opening GrabFood homepage..."
+            # ---- Step 1: Visit homepage to get a valid session + cookies ----
+            scrape_jobs[job_id]["message"] = "Establishing session..."
             await page.goto("https://food.grab.com/ph/en/", wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(3000)
-            logger.info(f"Homepage loaded: {page.url}")
 
-            # ---- Step 2: Set localStorage with location ----
-            scrape_jobs[job_id]["message"] = "Setting location..."
+            # ---- Step 2: Set localStorage with target location ----
+            scrape_jobs[job_id]["message"] = f"Setting location to {label}..."
             await page.evaluate("""(params) => {
                 const loc = {
                     latitude: params.lat, longitude: params.lng,
@@ -353,19 +338,13 @@ async def scrape_grabfood(job_id: str, location_key: str, custom_lat: Optional[f
                 localStorage.setItem('gfc_country', 'PH');
             }""", {"lat": lat, "lng": lng, "label": label})
 
-            # ---- Step 3: Reload so localStorage takes effect ----
-            scrape_jobs[job_id]["message"] = "Reloading with location set..."
-            await page.reload(wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(3000)
-
-            # ---- Step 4: Navigate to restaurants page ----
-            scrape_jobs[job_id]["message"] = "Loading restaurants..."
+            # ---- Step 3: Navigate to restaurants to establish proper session ----
+            scrape_jobs[job_id]["message"] = "Loading restaurants page..."
             await page.goto("https://food.grab.com/ph/en/restaurants", wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(5000)
-            logger.info(f"Restaurants page loaded: {page.url}")
 
-            # ---- Step 5: Extract __NEXT_DATA__ ----
-            scrape_jobs[job_id]["message"] = "Extracting page data..."
+            # ---- Step 4: Extract initial merchants from __NEXT_DATA__ ----
+            scrape_jobs[job_id]["message"] = "Extracting initial data..."
             try:
                 nd_raw = await page.evaluate("""() => {
                     const el = document.getElementById('__NEXT_DATA__');
@@ -381,79 +360,87 @@ async def scrape_grabfood(job_id: str, location_key: str, custom_lat: Optional[f
             except Exception as e:
                 logger.warning(f"__NEXT_DATA__ error: {e}")
 
-            # Process any API responses from page load
-            for resp in api_responses:
-                for m in find_merchants_in_data(resp):
-                    mid = m.get("id", m.get("chainID", "unknown"))
-                    merchants[mid] = extract_merchant_data(m)
+            initial_count = len(merchants)
+            scrape_jobs[job_id]["count"] = initial_count
+            scrape_jobs[job_id]["message"] = f"Got {initial_count} initial merchants. Now fetching all via API..."
 
-            scrape_jobs[job_id]["count"] = len(merchants)
-            scrape_jobs[job_id]["message"] = f"Initial: {len(merchants)} merchants. Paginating..."
+            # ---- Step 5: Direct API pagination from browser context ----
+            # This is the key fix: instead of clicking "Load More" (which breaks),
+            # we call the same API endpoint directly from within the page context.
+            # Being on food.grab.com means no CORS issues, and we inherit the session.
+            offset = 0
+            page_size = 32
+            empty_pages = 0
+            api_page = 0
 
-            # ---- Step 6: Click Load More repeatedly ----
-            consecutive_fails = 0
-            pages_loaded = 0
-            prev_api_count = len(api_responses)
-
-            for i in range(150):
+            while empty_pages < 3:
                 try:
-                    # Try multiple selectors
-                    btn = None
-                    for sel in [
-                        'button.ant-btn.ant-btn-block',
-                        'button:has-text("Load More")',
-                        'button:has-text("Show More")',
-                        '[class*="loadMore"] button',
-                        '[class*="load-more"] button',
-                        'button[class*="RestaurantList"]',
-                    ]:
-                        try:
-                            candidate = await page.query_selector(sel)
-                            if candidate and await candidate.is_visible():
-                                btn = candidate
-                                break
-                        except:
-                            continue
+                    result = await page.evaluate("""async (params) => {
+                        try {
+                            const resp = await fetch('https://portal.grab.com/foodweb/v2/search', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'x-gfc-country': 'PH',
+                                },
+                                body: JSON.stringify({
+                                    latlng: params.latlng,
+                                    keyword: '',
+                                    offset: params.offset,
+                                    pageSize: params.pageSize,
+                                    countryCode: 'PH',
+                                })
+                            });
+                            if (!resp.ok) {
+                                const text = await resp.text();
+                                return {error: 'HTTP ' + resp.status, body: text.substring(0, 200)};
+                            }
+                            return await resp.json();
+                        } catch(e) {
+                            return {error: e.message};
+                        }
+                    }""", {
+                        "latlng": f"{lat},{lng}",
+                        "offset": offset,
+                        "pageSize": page_size,
+                    })
 
-                    if not btn:
-                        # Try scrolling
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        await page.wait_for_timeout(2000)
-                        consecutive_fails += 1
-                        if consecutive_fails >= 3:
-                            break
+                    api_page += 1
+
+                    if not result or "error" in result:
+                        logger.info(f"API page {api_page} error: {result}")
+                        empty_pages += 1
+                        offset += page_size
                         continue
 
-                    consecutive_fails = 0
-                    await btn.scroll_into_view_if_needed()
-                    await page.wait_for_timeout(300)
-                    await btn.click()
-                    pages_loaded += 1
+                    found = find_merchants_in_data(result)
 
-                    await page.wait_for_timeout(4000)
-
-                    # Process new API responses
-                    for resp in api_responses[prev_api_count:]:
-                        for m in find_merchants_in_data(resp):
+                    if not found:
+                        empty_pages += 1
+                        logger.info(f"API page {api_page}: 0 new merchants (empty_pages={empty_pages})")
+                    else:
+                        empty_pages = 0
+                        before = len(merchants)
+                        for m in found:
                             mid = m.get("id", m.get("chainID", "unknown"))
                             merchants[mid] = extract_merchant_data(m)
-                    prev_api_count = len(api_responses)
+                        new_count = len(merchants) - before
+                        logger.info(f"API page {api_page}: +{new_count} merchants (total: {len(merchants)})")
 
                     scrape_jobs[job_id]["count"] = len(merchants)
-                    scrape_jobs[job_id]["message"] = f"Loading... {len(merchants)} merchants ({pages_loaded} pages)"
+                    scrape_jobs[job_id]["message"] = f"Fetching... {len(merchants)} merchants (page {api_page})"
+
+                    offset += page_size
+
+                    # Polite delay between requests
+                    await page.wait_for_timeout(1500)
 
                 except Exception as e:
-                    logger.warning(f"Load more error: {e}")
-                    consecutive_fails += 1
-                    if consecutive_fails >= 3:
-                        break
+                    logger.warning(f"API page {api_page} exception: {e}")
+                    empty_pages += 1
+                    offset += page_size
 
-            # ---- Step 7: Fallback — try direct API from browser ----
-            if len(merchants) == 0:
-                scrape_jobs[job_id]["message"] = "Trying direct API approach..."
-                logger.info("No merchants from page. Trying direct API from browser context...")
-                direct = await try_direct_api(page, lat, lng, scrape_jobs, job_id)
-                merchants.update(direct)
+            logger.info(f"API pagination done. {api_page} pages, {len(merchants)} total merchants")
 
             await browser.close()
 
@@ -488,59 +475,6 @@ def find_merchants_in_data(data, depth=0) -> list:
                 merchants.extend(find_merchants_in_data(item, depth + 1))
     return merchants
 
-
-async def try_direct_api(page, lat, lng, scrape_jobs, job_id) -> dict:
-    merchants = {}
-    offset = 0
-    page_size = 32
-
-    for attempt in range(50):
-        try:
-            result = await page.evaluate("""async (params) => {
-                try {
-                    const resp = await fetch('https://portal.grab.com/foodweb/v2/search', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                            'x-gfc-country': 'PH',
-                        },
-                        body: JSON.stringify({
-                            latlng: params.lat + ',' + params.lng,
-                            keyword: '',
-                            offset: params.offset,
-                            pageSize: params.pageSize,
-                            countryCode: 'PH',
-                        })
-                    });
-                    if (!resp.ok) return {error: 'HTTP ' + resp.status, status: resp.status};
-                    return await resp.json();
-                } catch(e) {
-                    return {error: e.message};
-                }
-            }""", {"lat": str(lat), "lng": str(lng), "offset": offset, "pageSize": page_size})
-
-            if not result or "error" in result:
-                logger.info(f"Direct API stopped: {result}")
-                break
-
-            found = find_merchants_in_data(result)
-            if not found:
-                break
-
-            for m in found:
-                mid = m.get("id", m.get("chainID", "unknown"))
-                merchants[mid] = extract_merchant_data(m)
-
-            scrape_jobs[job_id]["count"] = len(merchants)
-            scrape_jobs[job_id]["message"] = f"Direct API: {len(merchants)} merchants (page {attempt + 1})"
-            offset += page_size
-            await page.wait_for_timeout(1500)
-
-        except Exception as e:
-            logger.warning(f"Direct API error: {e}")
-            break
-
-    return merchants
 
 
 def extract_merchant_data(m: dict) -> dict:
